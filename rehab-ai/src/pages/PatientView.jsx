@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { usePoseLandmarker } from '../hooks/usePoseLandmarker';
+import RehabCanvasGame from '../components/RehabCanvasGame'; // <-- Cleanly imported
 
 const calculateAngle = (a, b, c) => {
   const radians = Math.atan2(c.y - b.y, c.x - b.x) - Math.atan2(a.y - b.y, a.x - b.x);
@@ -35,6 +36,10 @@ export default function PatientView() {
   const [currentExercise, setCurrentExercise] = useState(null);
   const [reps, setReps] = useState(0);
   
+  // New state to pass to the external game component
+  const [normalizedInput, setNormalizedInput] = useState(0);
+  const [isFormValid, setIsFormValid] = useState(true);
+  
   const isDownRef = useRef(false);
   const repsRef = useRef(0);
   const lastRepTime = useRef(0);
@@ -62,7 +67,7 @@ export default function PatientView() {
     fetchExercise();
   }, [navigate]);
 
-  // 2. Camera & Rendering Logic (Only runs if mode === 'scanner')
+  // 2. Camera & Rendering Logic
   useEffect(() => {
     if (mode !== 'scanner' || !isLoaded) return;
 
@@ -98,6 +103,11 @@ export default function PatientView() {
         const results = poseLandmarker.detectForVideo(video, startTimeMs);
 
         ctx.clearRect(0, 0, canvas.width, canvas.height);
+        
+        // Mirror the camera feed for natural interaction
+        ctx.save();
+        ctx.scale(-1, 1);
+        ctx.translate(-canvas.width, 0);
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
         if (results.landmarks && results.landmarks.length > 0) {
@@ -108,15 +118,47 @@ export default function PatientView() {
           const pt2 = landmarks[j2];
           const pt3 = landmarks[j3];
 
+          // Additional landmarks for posture tracking
+          const lShoulder = landmarks[11];
+          const rShoulder = landmarks[12];
+          const lEar = landmarks[7];
+
           if (pt1.visibility > 0.65 && pt2.visibility > 0.65 && pt3.visibility > 0.65) {
             const angle = calculateAngle(pt1, pt2, pt3);
             setArmAngle(Math.round(angle));
 
-            const isBadPosture = angle < currentExercise.failure_angle;
+            // --- 1. DIRECTION-AWARE NORMALIZATION ---
+            // If the DB doesn't have rest/target, we default to standard Bicep Curl bounds
+            const rest = currentExercise.rest_angle || 160; 
+            const target = currentExercise.target_angle || 40; 
+            
+            let rawProgress = 0;
+            if (rest > target) {
+              // Decreasing exercise (Bicep Curl: 160 -> 40)
+              rawProgress = (rest - angle) / (rest - target);
+            } else {
+              // Increasing exercise (Arm Raise: 20 -> 140)
+              rawProgress = (angle - rest) / (target - rest);
+            }
+            
+            const clampedProgress = Math.min(Math.max(rawProgress, 0.0), 1.0);
+            setNormalizedInput(clampedProgress);
 
-            if (angle < currentExercise.failure_angle) {
-              isDownRef.current = true; 
-            } else if (angle > currentExercise.success_angle && isDownRef.current) {
+            // --- 2. UNIVERSAL POSTURE CHECK ---
+            // Check if patient is shrugging or leaning to cheat the curl
+            let isBadPosture = false;
+            if (lShoulder && rShoulder && Math.abs(lShoulder.y - rShoulder.y) > 0.07) {
+              isBadPosture = true; // Shoulders uneven (leaning sideways)
+            } else if (lShoulder && lEar && Math.abs(lShoulder.y - lEar.y) < 0.08) {
+              isBadPosture = true; // Shrugging shoulder to ear
+            }
+            setIsFormValid(!isBadPosture);
+
+            // --- 3. FIX REP COUNTING ---
+            // Rely on the normalized progress (0.0 to 1.0) rather than raw angles
+            if (clampedProgress < 0.2) {
+              isDownRef.current = true; // Arm is back at rest
+            } else if (clampedProgress > 0.85 && isDownRef.current && !isBadPosture) {
               const currentTime = Date.now();
               if (currentTime - lastRepTime.current > 1000) {
                 repsRef.current += 1;
@@ -130,6 +172,7 @@ export default function PatientView() {
             drawBone(ctx, landmarks, j2, j3, canvas.width, canvas.height, isBadPosture); 
           }
         }
+        ctx.restore();
       }
       animationFrameId = requestAnimationFrame(renderLoop);
     };
@@ -198,7 +241,7 @@ export default function PatientView() {
     );
   }
 
-  // --- VIEW 2: AI SCANNER ---
+  // --- VIEW 2: AI SCANNER WITH SPLIT SCREEN GAME ---
   return (
     <div className="min-h-screen bg-gray-900 text-white flex flex-col items-center justify-center p-4 relative">
       <button 
@@ -208,16 +251,17 @@ export default function PatientView() {
         &larr; Back to Dashboard
       </button>
 
-      <h1 className="text-3xl font-bold mb-8 tracking-tight">Live <span className="text-teal-400">Tracking</span></h1>
+      <h1 className="text-3xl font-bold mb-6 tracking-tight">Live <span className="text-teal-400">Tracking</span></h1>
       
-      <div className="flex gap-4 mb-8">
+      {/* Telemetry Header */}
+      <div className="flex gap-4 mb-6">
         <div className="bg-gray-800 px-6 py-4 rounded-xl border border-gray-700">
           <p className="text-sm text-gray-400 mb-1">Exercise</p>
           <p className="text-xl font-bold text-teal-400">{currentExercise?.name}</p>
         </div>
         <div className="bg-gray-800 px-6 py-4 rounded-xl border border-gray-700">
           <p className="text-sm text-gray-400 mb-1">Live Angle</p>
-          <p className={`text-xl font-bold ${currentExercise && armAngle < currentExercise.failure_angle ? 'text-red-400' : 'text-teal-400'}`}>
+          <p className={`text-xl font-bold ${!isFormValid ? 'text-red-400' : 'text-teal-400'}`}>
             {armAngle}°
           </p>
         </div>
@@ -227,9 +271,24 @@ export default function PatientView() {
         </div>
       </div>
 
-      <div className="relative border-4 border-gray-700 rounded-2xl overflow-hidden shadow-2xl bg-black mb-8">
-        <video ref={videoRef} className="hidden" playsInline muted />
-        <canvas ref={canvasRef} className="block w-[640px] h-[480px]" />
+      {/* SPLIT SCREEN LAYOUT */}
+      <div className="w-full max-w-6xl grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+        
+        {/* Left Side: Camera & Skeleton */}
+        <div className="relative border-4 border-gray-700 rounded-2xl overflow-hidden shadow-2xl bg-black">
+          <video ref={videoRef} className="hidden" playsInline muted />
+          <canvas ref={canvasRef} className="block w-full h-auto aspect-[4/3] max-w-[640px] max-h-[480px]" />
+        </div>
+
+        {/* Right Side: Imported Gamification Canvas */}
+        <div className="border-4 border-gray-700 rounded-2xl overflow-hidden shadow-2xl bg-slate-900 flex items-center justify-center relative">
+          <RehabCanvasGame 
+            normalizedInput={normalizedInput} 
+            isFormValid={isFormValid}
+            // Passing the internal manual rep counter is optional if the game handles its own internal scoring!
+          />
+        </div>
+
       </div>
 
       <button 
